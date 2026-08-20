@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-VidKing Stream Extractor with Residential Proxy Rotation
+VidKing Stream Extractor
 GitHub Actions compatible — reads inputs from env vars or CLI args,
 writes output to results/<mediaType>_<tmdbId>[_sXeY].json
 
-FIXES applied (v3):
+FIXES applied (v4):
   #1  Chrome UA updated to a real version (136) — fake v151 caused bot-detection 403s
   #2  Added sec-fetch-site / sec-fetch-mode / sec-fetch-dest to all requests
   #3  Added sec-ch-ua client-hint headers (Chrome always sends these)
   #4  Seed regex broadened — now catches seeds without a leading digit or dot
   #5  Removed vsrc / superflix from PROVIDERS (they return iframes, not m3u8 JSON)
   #6  tmdb_id coerced to int before crypto operations everywhere it matters
-  #7  fetch_seed() retries across multiple proxies and falls back gracefully
+  #7  fetch_seed() retries with exponential back-off and falls back gracefully
   #8  lizer123.site requests now include full browser header set
   #9  Added Accept-Encoding + Connection headers to match real Chrome
+  #10 Proxies removed — direct requests only
 """
 
 import sys
@@ -23,59 +24,12 @@ import json
 import time
 import base64
 import ctypes
-import random
 import requests
 import urllib3
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode, quote
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# ── Residential Proxy Pool ────────────────────────────────────────────────────
-# Format: (host, port, username, password, location)
-
-PROXY_POOL = [
-    # ── Batch 1 (user: zmglmvwl) ─────────────────────────────────────────────
-    ("31.59.20.176",    6754, "zmglmvwl", "puz74ldkgj3f", "UK-London"),
-    ("31.56.127.193",   7684, "zmglmvwl", "puz74ldkgj3f", "US-Seattle"),
-    ("45.38.107.97",    6014, "zmglmvwl", "puz74ldkgj3f", "UK-London"),
-    ("198.105.121.200", 6462, "zmglmvwl", "puz74ldkgj3f", "UK-London"),
-    ("64.137.96.74",    6641, "zmglmvwl", "puz74ldkgj3f", "ES-Madrid"),
-    ("198.23.243.226",  6361, "zmglmvwl", "puz74ldkgj3f", "US-LosAngeles"),
-    ("38.154.185.97",   6370, "zmglmvwl", "puz74ldkgj3f", "US-Piscataway"),
-    ("84.247.60.125",   6095, "zmglmvwl", "puz74ldkgj3f", "PL-Warsaw"),
-    ("142.111.67.146",  5611, "zmglmvwl", "puz74ldkgj3f", "JP-Tokyo"),
-    ("191.96.254.138",  6185, "zmglmvwl", "puz74ldkgj3f", "US-LosAngeles"),
-    # ── Batch 2 (user: dxicdysy) ─────────────────────────────────────────────
-    ("31.59.20.176",    6754, "dxicdysy",  "yndikr9coeto", "UK-London"),
-    ("31.56.127.193",   7684, "dxicdysy",  "yndikr9coeto", "US-Seattle"),
-    ("45.38.107.97",    6014, "dxicdysy",  "yndikr9coeto", "UK-London"),
-    ("198.105.121.200", 6462, "dxicdysy",  "yndikr9coeto", "UK-London"),
-    ("64.137.96.74",    6641, "dxicdysy",  "yndikr9coeto", "ES-Madrid"),
-    ("198.23.243.226",  6361, "dxicdysy",  "yndikr9coeto", "US-LosAngeles"),
-    ("38.154.185.97",   6370, "dxicdysy",  "yndikr9coeto", "US-Piscataway"),
-    ("84.247.60.125",   6095, "dxicdysy",  "yndikr9coeto", "PL-Warsaw"),
-    ("142.111.67.146",  5611, "dxicdysy",  "yndikr9coeto", "JP-Tokyo"),
-    ("191.96.254.138",  6185, "dxicdysy",  "yndikr9coeto", "US-LosAngeles"),
-]
-
-_proxy_index = 0
-
-
-def get_next_proxy():
-    global _proxy_index
-    entry = PROXY_POOL[_proxy_index % len(PROXY_POOL)]
-    _proxy_index += 1
-    host, port, user, pwd, loc = entry
-    proxy_url = f"http://{user}:{pwd}@{host}:{port}"
-    return {"http": proxy_url, "https": proxy_url}, loc
-
-
-def get_random_proxy():
-    entry = random.choice(PROXY_POOL)
-    host, port, user, pwd, loc = entry
-    proxy_url = f"http://{user}:{pwd}@{host}:{port}"
-    return {"http": proxy_url, "https": proxy_url}, loc
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -255,37 +209,34 @@ def decrypt_vidking_payload(ciphertext_b64, seed_str, tmdb_id):
         raise ValueError("Decryption failed: bad seed or corrupted payload")
     return raw_bytes[4:].decode("utf-8")
 
-# ── HTTP fetch with proxy rotation ────────────────────────────────────────────
+# ── HTTP fetch (direct, no proxy) ─────────────────────────────────────────────
 
-def fetch(url, extra_headers=None, retries=6, delay=1.0):
+def fetch(url, extra_headers=None, retries=4, delay=1.0):
     headers = {**HEADERS, **(extra_headers or {})}
     last_error = None
     for i in range(retries):
-        proxies, loc = get_next_proxy()
         try:
-            resp = requests.get(url, headers=headers, proxies=proxies, timeout=20, verify=False)
+            resp = requests.get(url, headers=headers, timeout=20, verify=False)
             if resp.status_code == 429:
-                print(f"  [WARN] 429 on proxy {loc} — rotating...")
-                time.sleep(delay)
+                wait = delay * (2 ** i)
+                print(f"  [WARN] 429 rate-limited — retrying in {wait:.1f}s...")
+                time.sleep(wait)
                 continue
             return resp
-        except requests.exceptions.ProxyError as exc:
-            last_error = exc
-            print(f"  [WARN] Proxy error [{loc}] — rotating... ({i+1}/{retries})")
-            time.sleep(delay * 0.5)
         except requests.exceptions.ConnectionError as exc:
             last_error = exc
-            print(f"  [WARN] Connection error [{loc}] — rotating... ({i+1}/{retries})")
+            print(f"  [WARN] Connection error — retrying... ({i+1}/{retries})")
             time.sleep(delay * 0.5)
         except requests.exceptions.Timeout as exc:
             last_error = exc
-            print(f"  [WARN] Timeout [{loc}] — rotating... ({i+1}/{retries})")
+            print(f"  [WARN] Timeout — retrying... ({i+1}/{retries})")
+            time.sleep(delay * 0.5)
         except Exception as exc:
             last_error = exc
             if i == retries - 1:
                 raise
             time.sleep(delay)
-    raise RuntimeError(f"All {retries} proxy attempts failed. Last error: {last_error}")
+    raise RuntimeError(f"All {retries} attempts failed. Last error: {last_error}")
 
 # ── Core pipeline ─────────────────────────────────────────────────────────────
 
@@ -341,7 +292,7 @@ def _extract_seed_from_text(text):
 
 
 def fetch_seed(tmdb_id, max_attempts=8):
-    """Fetch seed with proxy rotation and fallback logic. (FIX #7)"""
+    """Fetch seed with retry/back-off and fallback parsing. (FIX #7)"""
     url = f"{API_BASE}/seed?mediaId={tmdb_id}"
     last_text = ""
     for attempt in range(max_attempts):
@@ -649,7 +600,6 @@ def main():
         sys.exit(1)
 
     print(f"[START] VidKing Extractor — {len(entries)} title(s) from {ids_file}")
-    print(f"[PROXY] Pool loaded: {len(PROXY_POOL)} proxies")
     print()
 
     total_start  = time.time()

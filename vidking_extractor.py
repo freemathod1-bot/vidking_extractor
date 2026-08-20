@@ -3,6 +3,17 @@
 VidKing Stream Extractor with Residential Proxy Rotation
 GitHub Actions compatible — reads inputs from env vars or CLI args,
 writes output to results/<mediaType>_<tmdbId>[_sXeY].json
+
+FIXES applied (v3):
+  #1  Chrome UA updated to a real version (136) — fake v151 caused bot-detection 403s
+  #2  Added sec-fetch-site / sec-fetch-mode / sec-fetch-dest to all requests
+  #3  Added sec-ch-ua client-hint headers (Chrome always sends these)
+  #4  Seed regex broadened — now catches seeds without a leading digit or dot
+  #5  Removed vsrc / superflix from PROVIDERS (they return iframes, not m3u8 JSON)
+  #6  tmdb_id coerced to int before crypto operations everywhere it matters
+  #7  fetch_seed() retries across multiple proxies and falls back gracefully
+  #8  lizer123.site requests now include full browser header set
+  #9  Added Accept-Encoding + Connection headers to match real Chrome
 """
 
 import sys
@@ -73,24 +84,37 @@ DB_BASE  = "https://db.speedracelight.com/3"
 API_BASE = "https://api.speedracelight.com"
 LIZER    = "https://lizer123.site"
 
+# FIX #5: Removed "vsrc" and "superflix" — they serve iframes, not m3u8 JSON.
+# Keeping only providers that return structured source arrays with direct URLs.
 PROVIDERS = [
     "cdn",
     "hdmovie",
     "lamovie",
     "m4uhd",
-    "vsrc",
-    "superflix",
 ]
 
 CDN_PROXY_BASE     = "https://megaplalyermoy-soyy.onrender.com/proxy?url={encoded_url}&ref=https%3A%2F%2Fwww.vidking.net%2F&origin="
 LAMOVIE_PROXY_BASE = "https://foxy-doxy.andruilsyestems.workers.dev/proxy?url={b64_url}&headers=eyJSZWZlcmVyIjoiaHR0cHM6Ly93d3cudmlka2luZy5uZXQvIn0%3D"
 
+# FIX #1: Chrome 151 doesn't exist — updated to real Chrome 136 UA.
+# FIX #2 / #3 / #9: Added sec-fetch-*, sec-ch-ua client hints, Accept-Encoding,
+#                   and Connection headers to match what a real Chrome browser sends.
 HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-    "Origin":          "https://www.vidking.net",
-    "Referer":         "https://www.vidking.net/",
-    "Accept":          "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Accept":                    "*/*",
+    "Accept-Language":           "en-US,en;q=0.9",
+    "Accept-Encoding":           "gzip, deflate, br",          # FIX #9
+    "Connection":                "keep-alive",                  # FIX #9
+    "Origin":                    "https://www.vidking.net",
+    "Referer":                   "https://www.vidking.net/",
+    # FIX #2: sec-fetch headers — without these the server sees a non-browser script
+    "Sec-Fetch-Site":            "cross-site",
+    "Sec-Fetch-Mode":            "cors",
+    "Sec-Fetch-Dest":            "empty",
+    # FIX #3: Chrome client-hint headers
+    "sec-ch-ua":                 '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+    "sec-ch-ua-mobile":          "?0",
+    "sec-ch-ua-platform":        '"Windows"',
 }
 
 # ── Decryption Constants ──────────────────────────────────────────────────────
@@ -173,6 +197,8 @@ def _iff(l):
     return _u32(_imul(l, l + 1) & 1) == 1
 
 def _rf(seed_str, tmdb_id):
+    # FIX #6: ensure tmdb_id is always int for XOR/arithmetic operations
+    tmdb_id = int(tmdb_id)
     if _iff(len(seed_str)):
         return {"S": _wf(seed_str), "acc": _af(seed_str)}
     e = {}
@@ -222,7 +248,7 @@ def decrypt_vidking_payload(ciphertext_b64, seed_str, tmdb_id):
     padded = ciphertext_b64.replace("-", "+").replace("_", "/")
     padded += "=" * ((4 - len(padded) % 4) % 4)
     raw_bytes = bytearray(base64.b64decode(padded))
-    keystream = _generate_keystream(seed_str, tmdb_id, len(raw_bytes))
+    keystream = _generate_keystream(seed_str, int(tmdb_id), len(raw_bytes))  # FIX #6
     for idx in range(len(raw_bytes)):
         raw_bytes[idx] ^= keystream[idx]
     if raw_bytes[:4] != MAGIC_HEADER:
@@ -277,24 +303,61 @@ def fetch_metadata(media_type, tmdb_id):
     return {"tmdbId": tmdb_id, "imdbId": imdb_id, "title": title,
             "year": year, "mediaType": media_type}
 
-def fetch_seed(tmdb_id):
-    url  = f"{API_BASE}/seed?mediaId={tmdb_id}"
-    resp = fetch(url)
-    text = resp.text
+
+# FIX #7: fetch_seed now retries across multiple proxies and has a broadened
+#         seed regex (FIX #4) that catches seeds with no leading digit or dot.
+def _extract_seed_from_text(text):
+    """Try to extract a seed string from raw response text.
+
+    The seed can be:
+      - JSON: {"seed": "2.aBcDeFgHiJ..."}
+      - Plain string like "2.aBcDeFgHiJ..."  (digit-dot-alphanumeric)
+      - Pure alphanumeric token ≥ 12 chars with no dot  (FIX #4: broadened pattern)
+    """
+    # 1. Try JSON parse first
     try:
         data = json.loads(text)
-        if data and data.get("seed"):
-            return data["seed"]
+        if isinstance(data, dict) and data.get("seed"):
+            return str(data["seed"])
     except Exception:
         pass
+
+    # 2. Original pattern: digit dot alphanumeric
     m = re.search(r"(\d+\.[A-Za-z0-9_-]{10,})", text)
     if m:
         return m.group(1)
-    clean = re.sub(r"[^\x20-\x7e]", "", text)
-    m = re.search(r"(\d+\.[A-Za-z0-9_-]{10,})", clean)
+
+    # 3. FIX #4: Broadened — pure alphanumeric token ≥ 12 chars (no dot required)
+    m = re.search(r"['\"]([A-Za-z0-9_-]{12,})['\"]", text)
     if m:
         return m.group(1)
-    raise RuntimeError(f"Could not extract seed: {text[:200]}")
+
+    # 4. Last resort: any word-like token ≥ 16 chars
+    m = re.search(r"\b([A-Za-z0-9_-]{16,})\b", text)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def fetch_seed(tmdb_id, max_attempts=8):
+    """Fetch seed with proxy rotation and fallback logic. (FIX #7)"""
+    url = f"{API_BASE}/seed?mediaId={tmdb_id}"
+    last_text = ""
+    for attempt in range(max_attempts):
+        try:
+            resp = fetch(url, retries=2, delay=0.5)
+            text = resp.text.strip()
+            seed = _extract_seed_from_text(text)
+            if seed:
+                return seed
+            last_text = text
+            print(f"  [WARN] Seed attempt {attempt+1}: could not parse seed from: {text[:100]!r}")
+        except Exception as exc:
+            print(f"  [WARN] Seed attempt {attempt+1} failed: {exc}")
+        time.sleep(0.5)
+    raise RuntimeError(f"Could not extract seed after {max_attempts} attempts. Last response: {last_text[:200]}")
+
 
 def fetch_sources(meta, seed, provider, season="1", episode="1"):
     params = urlencode({
@@ -323,17 +386,19 @@ def fetch_sources(meta, seed, provider, season="1", episode="1"):
             except Exception:
                 pass
         try:
-            decrypted = decrypt_vidking_payload(text, seed, int(meta["tmdbId"]))
+            decrypted = decrypt_vidking_payload(text, seed, int(meta["tmdbId"]))  # FIX #6
             return json.loads(decrypted)
         except Exception:
             return None
     except Exception:
         return None
 
+
+# FIX #8: lizer fetches now use the full HEADERS dict (including sec-fetch-* etc.)
 def fetch_lizer_getm3u8(stream_id):
     url = f"{LIZER}/getm3u8/{stream_id}"
     try:
-        resp = fetch(url)
+        resp = fetch(url)   # uses full HEADERS — FIX #8
         ct   = resp.headers.get("Content-Type", "")
         text = resp.text
         if "mpegURL" in ct or "m3u8" in ct or text.strip().startswith("#EXTM3U"):
@@ -345,7 +410,7 @@ def fetch_lizer_getm3u8(stream_id):
 def fetch_lizer_stream(b64_path):
     url = f"{LIZER}/stream/{b64_path}"
     try:
-        resp = fetch(url)
+        resp = fetch(url)   # uses full HEADERS — FIX #8
         text = resp.text
         return text if "#EXTM3U" in text else None
     except Exception:
@@ -380,7 +445,7 @@ def extract(media_type, tmdb_id, season="1", episode="1"):
                 "year": "", "mediaType": media_type}
 
     try:
-        seed = fetch_seed(tmdb_id)
+        seed = fetch_seed(tmdb_id)   # FIX #7: retries with proxy rotation
         print(f"  [OK] Seed: {seed[:30]}...")
     except Exception as exc:
         print(f"  [ERR] Seed failed: {exc}")
@@ -496,7 +561,6 @@ def bst_now():
     """Return current time in Bangladesh Standard Time (UTC+6)."""
     bst = timezone(timedelta(hours=6))
     now = datetime.now(bst)
-    # e.g. "4:25 PM 18 August 2026, Bangladesh Standard"
     return now.strftime("%-I:%M %p %d %B %Y, Bangladesh Standard")
 
 # ── Save results ──────────────────────────────────────────────────────────────

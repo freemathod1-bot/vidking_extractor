@@ -532,54 +532,101 @@ def save_results(results, media_type, tmdb_id, season, episode):
     print(f"  [SAVED] {fname}")
     return fname
 
+# ── Parse a single VidKing embed URL ─────────────────────────────────────────
+
+def parse_embed_url(line):
+    """
+    Parse a VidKing embed URL into (media_type, tmdb_id, season, episode).
+
+    Supported formats in tmdbids.txt:
+      https://www.vidking.net/embed/movie/218
+      https://www.vidking.net/embed/tv/1396/2/5
+      218                          (bare ID → treated as movie)
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+
+    # TV:  /embed/tv/<id>/<season>/<episode>
+    m = re.search(r"/embed/tv/(\d+)/(\d+)/(\d+)", line)
+    if m:
+        return "tv", m.group(1), m.group(2), m.group(3)
+
+    # Movie: /embed/movie/<id>
+    m = re.search(r"/embed/movie/(\d+)", line)
+    if m:
+        return "movie", m.group(1), "1", "1"
+
+    # Bare TMDB ID
+    if re.fullmatch(r"\d+", line):
+        return "movie", line, "1", "1"
+
+    print(f"[SKIP] Cannot parse line: {line}")
+    return None
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    # Priority: CLI args > environment variables > defaults
-    # Usage: python vidking_extractor.py <media_type> <tmdb_id> [season] [episode]
-    # Or set: INPUT_MEDIA_TYPE, INPUT_TMDB_ID, INPUT_SEASON, INPUT_EPISODE
+    ids_file = os.environ.get("TMDB_IDS_FILE", "tmdbids.txt")
 
-    if len(sys.argv) >= 3:
-        media_type = sys.argv[1].lower()
-        tmdb_id    = sys.argv[2]
-        season     = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("INPUT_SEASON", "1")
-        episode    = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("INPUT_EPISODE", "1")
-    else:
-        media_type = os.environ.get("INPUT_MEDIA_TYPE", "movie").lower()
-        tmdb_id    = os.environ.get("INPUT_TMDB_ID", "")
-        season     = os.environ.get("INPUT_SEASON", "1")
-        episode    = os.environ.get("INPUT_EPISODE", "1")
-
-    if not tmdb_id:
-        print("[ERROR] TMDB ID is required. Pass as CLI arg or set INPUT_TMDB_ID env var.")
+    if not os.path.exists(ids_file):
+        print(f"[ERROR] {ids_file} not found. Create it with one VidKing embed URL per line.")
         sys.exit(1)
 
-    if media_type not in ("movie", "tv"):
-        print(f"[ERROR] Invalid media type '{media_type}'. Use 'movie' or 'tv'.")
+    with open(ids_file, encoding="utf-8") as f:
+        lines = f.readlines()
+
+    entries = [parse_embed_url(l) for l in lines]
+    entries = [e for e in entries if e]
+
+    if not entries:
+        print(f"[ERROR] No valid entries found in {ids_file}.")
         sys.exit(1)
 
-    print(f"[START] VidKing Extractor — {media_type.upper()} | TMDB: {tmdb_id}" +
-          (f" | S{season.zfill(2)}E{episode.zfill(2)}" if media_type == "tv" else ""))
+    print(f"[START] VidKing Extractor — {len(entries)} title(s) from {ids_file}")
     print(f"[PROXY] Pool loaded: {len(PROXY_POOL)} proxies")
+    print()
 
-    start = time.time()
-    try:
-        results = extract(media_type, tmdb_id, season, episode)
-    except Exception as exc:
-        print(f"[ERROR] Extraction failed: {exc}")
-        # Still save a failure JSON
-        save_results([], media_type, tmdb_id, season, episode)
+    total_start  = time.time()
+    saved_files  = []
+    any_failed   = False
+
+    for idx, (media_type, tmdb_id, season, episode) in enumerate(entries, 1):
+        label = (f"{media_type.upper()} {tmdb_id} S{season.zfill(2)}E{episode.zfill(2)}"
+                 if media_type == "tv" else f"{media_type.upper()} {tmdb_id}")
+        print(f"[{idx}/{len(entries)}] {label}")
+
+        start = time.time()
+        try:
+            results = extract(media_type, tmdb_id, season, episode)
+        except Exception as exc:
+            print(f"  [ERROR] Extraction failed: {exc}")
+            save_results([], media_type, tmdb_id, season, episode)
+            any_failed = True
+            print()
+            continue
+
+        fname = save_results(results, media_type, tmdb_id, season, episode)
+        saved_files.append(fname)
+        elapsed = time.time() - start
+        print(f"  [DONE] {len(results)} stream(s) in {elapsed:.2f}s → {fname}")
+        print()
+
+    print(f"[FINISHED] {len(saved_files)}/{len(entries)} succeeded in "
+          f"{time.time() - total_start:.2f}s")
+
+    # Print all saved JSON files to stdout (visible in Actions log)
+    for fname in saved_files:
+        print(f"\n{'='*60}")
+        print(f"FILE: {fname}")
+        print('='*60)
+        with open(fname) as f:
+            print(f.read())
+
+    if any_failed:
         sys.exit(1)
 
-    fname = save_results(results, media_type, tmdb_id, season, episode)
-    elapsed = time.time() - start
-    print(f"[DONE] {len(results)} stream(s) found in {elapsed:.2f}s")
-    print(f"[FILE] {fname}")
-
-    # Print to stdout for GitHub Actions step summary
-    print("\n--- OUTPUT JSON ---")
-    with open(fname) as f:
-        print(f.read())
 
 if __name__ == "__main__":
     try:
